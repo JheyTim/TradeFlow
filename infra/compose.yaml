@@ -1,0 +1,132 @@
+# Give our Docker Compose project a predictable name.
+name: tradeflow
+
+services:
+  # -------------------------------------------
+  # PostgreSQL: persistent relational database
+  # -------------------------------------------
+  postgres:
+    # Use a fixed major version to avoid surprise major upgrades.
+    image: postgres:17-alpine
+
+    # Automatically restart unless manually stopped.
+    restart: unless-stopped
+
+    # Only expose the database to the local computer.
+    ports:
+      - '127.0.0.1:5432:5432'
+
+    # Read credentials from the local environment.
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB}
+
+    # Store database data independently from the container.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    # Verify that PostgreSQL is ready to accept connections.
+    # $$ escapes variable interpolation by Docker Compose.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    networks:
+      - tradeflow_network
+
+  # -------------------------------------------
+  # Redis: local in-memory caching service
+  # -------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+
+    # Limit the published Redis port to this computer.
+    ports:
+      - '127.0.0.1:6379:6379'
+
+    # Check whether Redis can answer a PING command.
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - tradeflow_network
+
+  # -------------------------------------------
+  # RabbitMQ: asynchronous message broker
+  # -------------------------------------------
+  rabbitmq:
+    image: rabbitmq:4.3-management-alpine
+    restart: unless-stopped
+
+    # Keep the node identity stable across container recreation.
+    hostname: rabbitmq
+
+    ports:
+      # AMQP port used by backend applications.
+      - '127.0.0.1:5672:5672'
+
+      # Web management dashboard.
+      - '127.0.0.1:15672:15672'
+
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?Set RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD}
+
+    # Preserve broker data between container restarts.
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+    # Check whether the RabbitMQ application is running.
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'check_running']
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+    networks:
+      - tradeflow_network
+
+  # -------------------------------------------
+  # Floci: free local AWS service emulator
+  # -------------------------------------------
+  floci:
+    image: floci/floci:1.5.11
+    restart: unless-stopped
+
+    # AWS-compatible APIs are available on this port.
+    ports:
+      - '127.0.0.1:4566:4566'
+
+    environment:
+      # Persist emulator resources to local storage.
+      FLOCI_STORAGE_MODE: persistent
+      FLOCI_STORAGE_PERSISTENT_PATH: /app/data
+
+    # Preserve simulated S3 and SQS state.
+    volumes:
+      - floci_data:/app/data
+
+    networks:
+      - tradeflow_network
+
+# A private bridge network connects our infrastructure containers.
+networks:
+  tradeflow_network:
+    driver: bridge
+
+# Docker manages these named volumes independently of containers.
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  floci_data:
