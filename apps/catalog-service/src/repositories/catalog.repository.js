@@ -122,5 +122,103 @@ export const catalogRepository = {
     return this.findById(id);
   },
 
-  // The stock reservation implementation follows in Milestone 4.
+  // Reserve inventory as one atomic database operation.
+  async reserveStock({ productId, quantity, requestKey }) {
+    return sequelize.transaction(async (transaction) => {
+      // Return the existing reservation for a repeated request key.
+      // This prevents retrying a completed reservation.
+      const existing = await Reservation.findOne({
+        where: { requestKey },
+        transaction,
+      });
+
+      if (existing) {
+        // An idempotency key cannot represent two different operations.
+        if (
+          existing.productId !== productId ||
+          existing.quantity !== quantity
+        ) {
+          throw new AppError(409, 'IDEMPOTENCY_KEY_CONFLICT');
+        }
+
+        return {
+          reservation: existing.get({ plain: true }),
+          created: false,
+        };
+      }
+
+      // Lock the inventory row until this transaction commits.
+      // Competing reservations for the same product must wait.
+      const inventory = await Inventory.findByPk(productId, {
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+
+      if (!inventory) {
+        throw new AppError(404, 'PRODUCT_NOT_FOUND');
+      }
+
+      // Confirm the product can still be purchased.
+      const product = await Product.findByPk(productId, {
+        transaction,
+      });
+
+      if (!product.isActive) {
+        throw new AppError(409, 'PRODUCT_INACTIVE');
+      }
+
+      // Check the idempotency key again after waiting for the row lock.
+      // Another request may have committed while we were waiting.
+      const afterLock = await Reservation.findOne({
+        where: { requestKey },
+        transaction,
+      });
+
+      if (afterLock) {
+        if (
+          afterLock.productId !== productId ||
+          afterLock.quantity !== quantity
+        ) {
+          throw new AppError(409, 'IDEMPOTENCY_KEY_CONFLICT');
+        }
+
+        return {
+          reservation: afterLock.get({ plain: true }),
+          created: false,
+        };
+      }
+
+      // Calculate the remaining sellable stock.
+      const available = inventory.onHand - inventory.reserved;
+
+      if (available < quantity) {
+        throw new AppError(409, 'INSUFFICIENT_STOCK');
+      }
+
+      // Increase reserved stock without changing the physical quantity.
+      await inventory.update(
+        {
+          reserved: inventory.reserved + quantity,
+        },
+        { transaction },
+      );
+
+      // Record the reservation in the same transaction.
+      const reservation = await Reservation.create(
+        {
+          productId,
+          requestKey,
+          quantity,
+          status: 'ACTIVE',
+        },
+        { transaction },
+      );
+
+      // Commit both changes together, or roll back both on failure.
+      return {
+        reservation: reservation.get({ plain: true }),
+        created: true,
+      };
+    });
+  },
 };
